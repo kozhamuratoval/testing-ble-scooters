@@ -1,139 +1,110 @@
 import noble, { Peripheral, Characteristic, Service } from "@abandonware/noble";
 
-const TARGET_SERVICE = "6e400001b5a3f393e0a9e50e24dcca9e"; // как и раньше
-const STX = Buffer.from([0xa3, 0xa4]);
-// ⚠️ замени, если знаешь настоящий ключ
-const DEVICE_KEY = Buffer.from("796F546D4B35307A", "hex");
+const UART_SERVICE = "6e400001b5a3f393e0a9e50e24dcca9e";
+const UART_WRITE = "6e400002b5a3f393e0a9e50e24dcca9e";
+const UART_NOTIFY = "6e400003b5a3f393e0a9e50e24dcca9e";
+const DEVICE_INFO_SERVICE = "180a";
 
-function crc8(data: Buffer, poly = 0x07, init = 0x00): number {
-  let crc = init;
-  for (const b of data) {
-    crc ^= b;
-    for (let i = 0; i < 8; i++) {
-      if (crc & 0x80) crc = ((crc << 1) & 0xff) ^ poly;
-      else crc = (crc << 1) & 0xff;
-    }
-  }
-  return crc & 0xff;
-}
+// просто для теста пришлём потом 1 байт
+const TEST_PAYLOAD = Buffer.from([0x01]);
 
-// вариант из PDF: STX + LEN + BODY + CRC, XOR по (RAND+0x32)
-function buildFrame_STX(cmd: number, data: Buffer, key?: Buffer): Buffer {
-  const keyField = key ?? Buffer.alloc(8, 0x00);
-  const rand = Math.floor(Math.random() * 256);
-  const xorVal = (rand + 0x32) & 0xff;
-  const randBuf = Buffer.from([rand]);
-  const encData = Buffer.from(data.map((b) => b ^ xorVal));
-  const body = Buffer.concat([randBuf, keyField, Buffer.from([cmd]), encData]);
-  const len = Buffer.from([body.length + 1]);
-  const crc = Buffer.from([crc8(Buffer.concat([len, body]))]);
-  return Buffer.concat([STX, len, body, crc]);
-}
-
-// «облегчённый» вариант: БЕЗ STX, иногда так делают в BLE
-function buildFrame_NO_STX(cmd: number, data: Buffer, key?: Buffer): Buffer {
-  const keyField = key ?? Buffer.alloc(8, 0x00);
-  const rand = Math.floor(Math.random() * 256);
-  const xorVal = (rand + 0x32) & 0xff;
-  const randBuf = Buffer.from([rand]);
-  const encData = Buffer.from(data.map((b) => b ^ xorVal));
-  const body = Buffer.concat([randBuf, keyField, Buffer.from([cmd]), encData]);
-  const len = Buffer.from([body.length + 1]);
-  const crc = Buffer.from([crc8(Buffer.concat([len, body]))]);
-  return Buffer.concat([len, body, crc]);
-}
-
-async function dumpGatt(peripheral: Peripheral) {
-  const services: Service[] = await peripheral.discoverServicesAsync([]);
-  console.log("📜 Сервисы:");
-  for (const s of services) {
-    console.log(`  - ${s.uuid}`);
-    const chars: Characteristic[] = await s.discoverCharacteristicsAsync([]);
-    for (const c of chars) {
-      console.log(
-        `      • ${c.uuid} props=${JSON.stringify(c.properties)}`
+async function readIfExists(
+  peripheral: Peripheral,
+  serviceUUID: string,
+  charUUID: string
+): Promise<string | null> {
+  try {
+    const { characteristics } =
+      await peripheral.discoverSomeServicesAndCharacteristicsAsync(
+        [serviceUUID],
+        [charUUID]
       );
-    }
+    const ch = characteristics[0];
+    if (!ch) return null;
+    const data = await ch.readAsync();
+    return data.toString("utf8");
+  } catch (_) {
+    return null;
   }
 }
 
 async function main() {
-  console.log("🔎 Сканирую...");
+  console.log("🔎 Сканирую (ищу Scooter)...");
   noble.on("stateChange", async (state) => {
     if (state === "poweredOn") {
-      await noble.startScanningAsync([], false); // сканим всё, не только по сервису
+      await noble.startScanningAsync([], false);
     }
   });
 
   noble.on("discover", async (peripheral: Peripheral) => {
-    const name = peripheral.advertisement.localName || "?";
-    // фильтр по имени, чтобы не цеплять всё подряд
+    const name = peripheral.advertisement.localName || "";
     if (!name.toLowerCase().includes("scooter")) return;
 
-    console.log(`\n🚲 Найдено: ${name} (${peripheral.address || "no-mac"})`);
+    console.log(`\n🚲 Найден: ${name} (${peripheral.address || "no-mac"})`);
     await noble.stopScanningAsync();
-
     await peripheral.connectAsync();
-    console.log("✅ Подключились, читаем GATT...");
-    await dumpGatt(peripheral);
+    console.log("✅ Подключились");
 
-    const { characteristics } =
-      await peripheral.discoverSomeServicesAndCharacteristicsAsync([], []);
-
-    // подписываемся на все notify/indicate
-    const notifyChars: Characteristic[] = [];
-    for (const ch of characteristics) {
-      if (ch.properties.includes("notify") || ch.properties.includes("indicate")) {
-        notifyChars.push(ch);
-        ch.on("data", (data, isNotify) => {
-          console.log(
-            `📩 notify from ${ch.uuid}: ${data.toString("hex")}`
-          );
-        });
-        await ch.subscribeAsync().catch(() => {});
+    // 1) выведем GATT
+    const services: Service[] = await peripheral.discoverServicesAsync([]);
+    console.log("📜 Сервисы:");
+    for (const s of services) {
+      console.log(`  - ${s.uuid}`);
+      const chars = await s.discoverCharacteristicsAsync([]);
+      for (const c of chars) {
+        console.log(`      • ${c.uuid} props=${JSON.stringify(c.properties)}`);
       }
     }
 
-    console.log(`🔔 Подписались на ${notifyChars.length} характеристик`);
+    // 2) пробуем вычитать Device Info
+    console.log("\n📦 Device Information:");
+    const man = await readIfExists(peripheral, DEVICE_INFO_SERVICE, "2a29"); // manufacturer
+    const model = await readIfExists(peripheral, DEVICE_INFO_SERVICE, "2a24"); // model
+    const serial = await readIfExists(peripheral, DEVICE_INFO_SERVICE, "2a25"); // serial
+    const fw = await readIfExists(peripheral, DEVICE_INFO_SERVICE, "2a26"); // firmware
+    const hw = await readIfExists(peripheral, DEVICE_INFO_SERVICE, "2a27"); // hardware
+    const sw = await readIfExists(peripheral, DEVICE_INFO_SERVICE, "2a28"); // software
+    console.log("  Manufacturer:", man);
+    console.log("  Model:", model);
+    console.log("  Serial:", serial);
+    console.log("  Firmware:", fw);
+    console.log("  Hardware:", hw);
+    console.log("  Software:", sw);
 
-    // все write/ writeWithoutResponse кандидаты
-    const writeChars = characteristics.filter((ch) =>
-      ch.properties.some((p) => p === "write" || p === "writeWithoutResponse")
+    // 3) подпишемся на UART notify
+    const { characteristics } =
+      await peripheral.discoverSomeServicesAndCharacteristicsAsync(
+        [UART_SERVICE],
+        [UART_WRITE, UART_NOTIFY]
+      );
+    const writeChar = characteristics.find((c) => c.uuid === UART_WRITE);
+    const notifyChar = characteristics.find((c) => c.uuid === UART_NOTIFY);
+
+    if (!writeChar || !notifyChar) {
+      console.log("❌ UART-характеристики не найдены");
+      process.exit(0);
+    }
+
+    notifyChar.on("data", (data) => {
+      console.log("📩 notify:", data.toString("hex"), "| ascii:", data.toString("utf8"));
+    });
+    await notifyChar.subscribeAsync();
+    console.log("🔔 Подписались на notify");
+
+    // 4) тестово что-то пошлём — просто чтобы увидеть, реагирует ли оно на сырой байт
+    // (это безопасно: 0x01 часто игнорируется)
+    await new Promise((r) => setTimeout(r, 300));
+    console.log("➡️ Пошлём тестовый байт 0x01 в UART write");
+    await writeChar.writeAsync(TEST_PAYLOAD, true).catch(() =>
+      writeChar.writeAsync(TEST_PAYLOAD, false)
     );
 
-    console.log(`📝 Будем писать в ${writeChars.length} характеристик`);
-
-    // 4 варианта фрейма
-    const frames = [
-      { desc: "STX cmd=0x01", buf: buildFrame_STX(0x01, DEVICE_KEY) },
-      { desc: "STX cmd=0x10", buf: buildFrame_STX(0x10, DEVICE_KEY) },
-      { desc: "noSTX cmd=0x01", buf: buildFrame_NO_STX(0x01, DEVICE_KEY) },
-      { desc: "noSTX cmd=0x10", buf: buildFrame_NO_STX(0x10, DEVICE_KEY) },
-    ];
-
-    for (const ch of writeChars) {
-      console.log(`\n➡️  Пишем в характеристику ${ch.uuid} ...`);
-      for (const fr of frames) {
-        console.log(`   → ${fr.desc}: ${fr.buf.toString("hex")}`);
-        try {
-          await ch.writeAsync(fr.buf, true).catch(() => ch.writeAsync(fr.buf, false));
-        } catch (e) {
-          console.log("     (write error)", e);
-        }
-        // дать устройству шанс ответить
-        await new Promise((r) => setTimeout(r, 800));
-      }
-    }
-
-    console.log("⏳ Ждём ответы 30 сек...");
+    console.log("⏳ Слушаем 30 секунд...");
     await new Promise((r) => setTimeout(r, 30000));
 
-    // отписаться и уйти
-    for (const ch of notifyChars) {
-      await ch.unsubscribeAsync().catch(() => {});
-    }
+    await notifyChar.unsubscribeAsync().catch(() => {});
     await peripheral.disconnectAsync().catch(() => {});
-    console.log("🏁 Готово.");
+    console.log("🏁 Готово");
     process.exit(0);
   });
 }
