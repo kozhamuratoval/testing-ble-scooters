@@ -1,8 +1,9 @@
-import noble, { Peripheral, Characteristic } from "@abandonware/noble";
+import noble, { Peripheral, Characteristic, Service } from "@abandonware/noble";
 
-const SERVICE_UUID = "6e400001b5a3f393e0a9e50e24dcca9e";
+const TARGET_SERVICE = "6e400001b5a3f393e0a9e50e24dcca9e"; // как и раньше
 const STX = Buffer.from([0xa3, 0xa4]);
-const DEVICE_KEY = Buffer.from("796F546D4B35307A", "hex"); // замени на свой, если известен
+// ⚠️ замени, если знаешь настоящий ключ
+const DEVICE_KEY = Buffer.from("796F546D4B35307A", "hex");
 
 function crc8(data: Buffer, poly = 0x07, init = 0x00): number {
   let crc = init;
@@ -16,113 +17,123 @@ function crc8(data: Buffer, poly = 0x07, init = 0x00): number {
   return crc & 0xff;
 }
 
-function buildFrame(cmd: number, data: Buffer, keyField?: Buffer): Buffer {
-  const key = keyField || Buffer.alloc(8, 0x00);
+// вариант из PDF: STX + LEN + BODY + CRC, XOR по (RAND+0x32)
+function buildFrame_STX(cmd: number, data: Buffer, key?: Buffer): Buffer {
+  const keyField = key ?? Buffer.alloc(8, 0x00);
   const rand = Math.floor(Math.random() * 256);
-  const randBuf = Buffer.from([rand]);
   const xorVal = (rand + 0x32) & 0xff;
-
-  const encrypted = Buffer.from(data.map((b) => b ^ xorVal));
-  const body = Buffer.concat([randBuf, key, Buffer.from([cmd]), encrypted]);
+  const randBuf = Buffer.from([rand]);
+  const encData = Buffer.from(data.map((b) => b ^ xorVal));
+  const body = Buffer.concat([randBuf, keyField, Buffer.from([cmd]), encData]);
   const len = Buffer.from([body.length + 1]);
   const crc = Buffer.from([crc8(Buffer.concat([len, body]))]);
   return Buffer.concat([STX, len, body, crc]);
 }
 
-function parseResponse(response: Buffer) {
-  if (response.length < 5) throw new Error("Short response");
-  const len = response[2];
-  const body = response.slice(3, 3 + len - 1);
-  const crcRecv = response[3 + len - 1];
-  const crcCalc = crc8(Buffer.concat([Buffer.from([len]), body]));
-  if (crcRecv !== crcCalc) throw new Error("CRC mismatch");
-  const rand = body[0];
+// «облегчённый» вариант: БЕЗ STX, иногда так делают в BLE
+function buildFrame_NO_STX(cmd: number, data: Buffer, key?: Buffer): Buffer {
+  const keyField = key ?? Buffer.alloc(8, 0x00);
+  const rand = Math.floor(Math.random() * 256);
   const xorVal = (rand + 0x32) & 0xff;
-  const data = Buffer.from(body.slice(10).map((b) => b ^ xorVal));
-  return data;
+  const randBuf = Buffer.from([rand]);
+  const encData = Buffer.from(data.map((b) => b ^ xorVal));
+  const body = Buffer.concat([randBuf, keyField, Buffer.from([cmd]), encData]);
+  const len = Buffer.from([body.length + 1]);
+  const crc = Buffer.from([crc8(Buffer.concat([len, body]))]);
+  return Buffer.concat([len, body, crc]);
 }
 
-async function testCombination(
-  peripheral: Peripheral,
-  writeUUID: string,
-  notifyUUID: string,
-  cmd: number
-): Promise<boolean> {
-  console.log(`\n🔹 Тест: WRITE=${writeUUID.slice(-4)}, NOTIFY=${notifyUUID.slice(-4)}, CMD=${cmd.toString(16)}`);
-
-  await peripheral.connectAsync();
-  const { characteristics } =
-    await peripheral.discoverSomeServicesAndCharacteristicsAsync(
-      [SERVICE_UUID],
-      [writeUUID, notifyUUID]
-    );
-
-  const writeChar = characteristics.find((c) => c.uuid === writeUUID) as Characteristic;
-  const notifyChar = characteristics.find((c) => c.uuid === notifyUUID) as Characteristic;
-  if (!writeChar || !notifyChar) throw new Error("Не найдены нужные характеристики");
-
-  const frame = buildFrame(cmd, DEVICE_KEY);
-  console.log("→ Отправляем:", frame.toString("hex"));
-
-  const responsePromise = new Promise<Buffer>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timeout")), 30000);
-    notifyChar.once("data", (data) => {
-      clearTimeout(timeout);
-      resolve(data);
-    });
-  });
-
-  await notifyChar.subscribeAsync();
-  await new Promise((r) => setTimeout(r, 300));
-  await writeChar.writeAsync(frame, true);
-
-  try {
-    const resp = await responsePromise;
-    console.log("✅ Ответ:", resp.toString("hex"));
-    const commKey = parseResponse(resp);
-    console.log("✅ Communication Key:", commKey.toString("hex"));
-    await notifyChar.unsubscribeAsync();
-    await peripheral.disconnectAsync();
-    return true;
-  } catch (err) {
-    console.log("❌ Нет ответа");
-    await notifyChar.unsubscribeAsync().catch(() => {});
-    await peripheral.disconnectAsync().catch(() => {});
-    return false;
+async function dumpGatt(peripheral: Peripheral) {
+  const services: Service[] = await peripheral.discoverServicesAsync([]);
+  console.log("📜 Сервисы:");
+  for (const s of services) {
+    console.log(`  - ${s.uuid}`);
+    const chars: Characteristic[] = await s.discoverCharacteristicsAsync([]);
+    for (const c of chars) {
+      console.log(
+        `      • ${c.uuid} props=${JSON.stringify(c.properties)}`
+      );
+    }
   }
 }
 
 async function main() {
-  console.log("🔍 Сканирую устройства Omni IoT...");
+  console.log("🔎 Сканирую...");
   noble.on("stateChange", async (state) => {
-    if (state === "poweredOn") await noble.startScanningAsync([SERVICE_UUID], false);
+    if (state === "poweredOn") {
+      await noble.startScanningAsync([], false); // сканим всё, не только по сервису
+    }
   });
 
   noble.on("discover", async (peripheral: Peripheral) => {
-    const adv = peripheral.advertisement;
-    console.log(`\nНайдено: ${adv.localName || "?"} (${peripheral.address})`);
+    const name = peripheral.advertisement.localName || "?";
+    // фильтр по имени, чтобы не цеплять всё подряд
+    if (!name.toLowerCase().includes("scooter")) return;
+
+    console.log(`\n🚲 Найдено: ${name} (${peripheral.address || "no-mac"})`);
     await noble.stopScanningAsync();
 
-    const combos = [
-      { write: "6e400002b5a3f393e0a9e50e24dcca9e", notify: "6e400003b5a3f393e0a9e50e24dcca9e", cmd: 0x01 },
-      { write: "6e400002b5a3f393e0a9e50e24dcca9e", notify: "6e400003b5a3f393e0a9e50e24dcca9e", cmd: 0x10 },
-      { write: "6e400003b5a3f393e0a9e50e24dcca9e", notify: "6e400002b5a3f393e0a9e50e24dcca9e", cmd: 0x01 },
-      { write: "6e400003b5a3f393e0a9e50e24dcca9e", notify: "6e400002b5a3f393e0a9e50e24dcca9e", cmd: 0x10 },
-    ];
+    await peripheral.connectAsync();
+    console.log("✅ Подключились, читаем GATT...");
+    await dumpGatt(peripheral);
 
-    for (const combo of combos) {
-      try {
-        const ok = await testCombination(peripheral, combo.write, combo.notify, combo.cmd);
-        if (ok) {
-          console.log("\n🎉 Найдена рабочая комбинация!");
-          process.exit(0);
-        }
-      } catch (e) {
-        console.error("Ошибка:", e);
+    const { characteristics } =
+      await peripheral.discoverSomeServicesAndCharacteristicsAsync([], []);
+
+    // подписываемся на все notify/indicate
+    const notifyChars: Characteristic[] = [];
+    for (const ch of characteristics) {
+      if (ch.properties.includes("notify") || ch.properties.includes("indicate")) {
+        notifyChars.push(ch);
+        ch.on("data", (data, isNotify) => {
+          console.log(
+            `📩 notify from ${ch.uuid}: ${data.toString("hex")}`
+          );
+        });
+        await ch.subscribeAsync().catch(() => {});
       }
     }
 
-    console.log("\n🚫 Устройство не ответило ни на одну комбинацию.");
+    console.log(`🔔 Подписались на ${notifyChars.length} характеристик`);
+
+    // все write/ writeWithoutResponse кандидаты
+    const writeChars = characteristics.filter((ch) =>
+      ch.properties.some((p) => p === "write" || p === "writeWithoutResponse")
+    );
+
+    console.log(`📝 Будем писать в ${writeChars.length} характеристик`);
+
+    // 4 варианта фрейма
+    const frames = [
+      { desc: "STX cmd=0x01", buf: buildFrame_STX(0x01, DEVICE_KEY) },
+      { desc: "STX cmd=0x10", buf: buildFrame_STX(0x10, DEVICE_KEY) },
+      { desc: "noSTX cmd=0x01", buf: buildFrame_NO_STX(0x01, DEVICE_KEY) },
+      { desc: "noSTX cmd=0x10", buf: buildFrame_NO_STX(0x10, DEVICE_KEY) },
+    ];
+
+    for (const ch of writeChars) {
+      console.log(`\n➡️  Пишем в характеристику ${ch.uuid} ...`);
+      for (const fr of frames) {
+        console.log(`   → ${fr.desc}: ${fr.buf.toString("hex")}`);
+        try {
+          await ch.writeAsync(fr.buf, true).catch(() => ch.writeAsync(fr.buf, false));
+        } catch (e) {
+          console.log("     (write error)", e);
+        }
+        // дать устройству шанс ответить
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    }
+
+    console.log("⏳ Ждём ответы 30 сек...");
+    await new Promise((r) => setTimeout(r, 30000));
+
+    // отписаться и уйти
+    for (const ch of notifyChars) {
+      await ch.unsubscribeAsync().catch(() => {});
+    }
+    await peripheral.disconnectAsync().catch(() => {});
+    console.log("🏁 Готово.");
     process.exit(0);
   });
 }
