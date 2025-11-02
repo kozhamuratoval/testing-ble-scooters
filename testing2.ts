@@ -1,13 +1,13 @@
 import noble, { Peripheral, Characteristic } from "@abandonware/noble";
 
-// UUID из спецификации Omni IoT (проверь в nRF Connect, иногда они могут быть перевёрнуты)
+// UUID из спецификации Omni IoT (в этом варианте — ПЕРЕСТАВЛЕНЫ)
 const SERVICE_UUID = "6e400001b5a3f393e0a9e50e24dcca9e";
-const WRITE_CHAR_UUID = "6e400002b5a3f393e0a9e50e24dcca9e";
-const NOTIFY_CHAR_UUID = "6e400003b5a3f393e0a9e50e24dcca9e";
+const WRITE_CHAR_UUID = "6e400003b5a3f393e0a9e50e24dcca9e"; // ⚠️ теперь write → ...0003
+const NOTIFY_CHAR_UUID = "6e400002b5a3f393e0a9e50e24dcca9e"; // ⚠️ теперь notify → ...0002
 
 // Константы
 const STX = Buffer.from([0xa3, 0xa4]);
-const DEVICE_KEY = Buffer.from("796F546D4B35307A", "hex"); // "yOTmK50z"
+const DEVICE_KEY = Buffer.from("796F546D4B35307A", "hex"); // пример "yOTmK50z"
 
 // CRC8 (poly = 0x07)
 function crc8(data: Buffer, poly = 0x07, init = 0x00): number {
@@ -27,14 +27,12 @@ function buildFrame(cmd: number, data: Buffer, keyField?: Buffer): Buffer {
   const key = keyField || Buffer.alloc(8, 0x00);
   const rand = Math.floor(Math.random() * 256);
   const randBuf = Buffer.from([rand]);
-  // по спецификации: XOR с RAND + 0x32
-  const xorVal = (rand + 0x32) & 0xff;
+  const xorVal = (rand + 0x32) & 0xff; // важное изменение
 
   const encrypted = Buffer.from(data.map((b) => b ^ xorVal));
   const body = Buffer.concat([randBuf, key, Buffer.from([cmd]), encrypted]);
   const len = Buffer.from([body.length + 1]); // +CRC
-  // CRC8 считается по LEN+BODY
-  const crc = Buffer.from([crc8(Buffer.concat([len, body]))]);
+  const crc = Buffer.from([crc8(Buffer.concat([len, body]))]); // CRC по LEN+BODY
   return Buffer.concat([STX, len, body, crc]);
 }
 
@@ -82,7 +80,7 @@ async function connectAndHandshake(peripheral: Peripheral): Promise<void> {
   console.log("Sending handshake frame:", frame.toString("hex"));
 
   const responsePromise = new Promise<Buffer>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timeout")), 30000); // 30 секунд
+    const timeout = setTimeout(() => reject(new Error("Timeout")), 30000); // 30 сек
     notifyChar.once("data", (data) => {
       clearTimeout(timeout);
       resolve(data);
@@ -90,7 +88,7 @@ async function connectAndHandshake(peripheral: Peripheral): Promise<void> {
   });
 
   await notifyChar.subscribeAsync();
-  await new Promise((r) => setTimeout(r, 300)); // небольшая пауза перед записью
+  await new Promise((r) => setTimeout(r, 300)); // пауза перед write
   await writeChar.writeAsync(frame, true);
 
   const resp = await responsePromise;
