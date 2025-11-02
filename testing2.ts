@@ -1,6 +1,6 @@
 import noble, { Peripheral, Characteristic } from "@abandonware/noble";
 
-// UUID из спецификации Omni IoT
+// UUID из спецификации Omni IoT (проверь в nRF Connect, иногда они могут быть перевёрнуты)
 const SERVICE_UUID = "6e400001b5a3f393e0a9e50e24dcca9e";
 const WRITE_CHAR_UUID = "6e400002b5a3f393e0a9e50e24dcca9e";
 const NOTIFY_CHAR_UUID = "6e400003b5a3f393e0a9e50e24dcca9e";
@@ -27,12 +27,14 @@ function buildFrame(cmd: number, data: Buffer, keyField?: Buffer): Buffer {
   const key = keyField || Buffer.alloc(8, 0x00);
   const rand = Math.floor(Math.random() * 256);
   const randBuf = Buffer.from([rand]);
-  const xorVal = rand & 0xff;
+  // по спецификации: XOR с RAND + 0x32
+  const xorVal = (rand + 0x32) & 0xff;
 
   const encrypted = Buffer.from(data.map((b) => b ^ xorVal));
   const body = Buffer.concat([randBuf, key, Buffer.from([cmd]), encrypted]);
   const len = Buffer.from([body.length + 1]); // +CRC
-  const crc = Buffer.from([crc8(body)]);
+  // CRC8 считается по LEN+BODY
+  const crc = Buffer.from([crc8(Buffer.concat([len, body]))]);
   return Buffer.concat([STX, len, body, crc]);
 }
 
@@ -43,7 +45,7 @@ function parseResponse(response: Buffer) {
   const len = response[2];
   const body = response.slice(3, 3 + len - 1);
   const crcRecv = response[3 + len - 1];
-  const crcCalc = crc8(body);
+  const crcCalc = crc8(Buffer.concat([Buffer.from([len]), body]));
   if (crcRecv !== crcCalc)
     throw new Error(`CRC mismatch: got ${crcRecv}, calc ${crcCalc}`);
 
@@ -51,7 +53,8 @@ function parseResponse(response: Buffer) {
   const keyField = body.slice(1, 9);
   const cmd = body[9];
   const encData = body.slice(10);
-  const data = Buffer.from(encData.map((b) => b ^ rand));
+  const xorVal = (rand + 0x32) & 0xff;
+  const data = Buffer.from(encData.map((b) => b ^ xorVal));
   return { rand, keyField, cmd, data };
 }
 
@@ -79,7 +82,7 @@ async function connectAndHandshake(peripheral: Peripheral): Promise<void> {
   console.log("Sending handshake frame:", frame.toString("hex"));
 
   const responsePromise = new Promise<Buffer>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timeout")), 6000);
+    const timeout = setTimeout(() => reject(new Error("Timeout")), 30000); // 30 секунд
     notifyChar.once("data", (data) => {
       clearTimeout(timeout);
       resolve(data);
@@ -87,6 +90,7 @@ async function connectAndHandshake(peripheral: Peripheral): Promise<void> {
   });
 
   await notifyChar.subscribeAsync();
+  await new Promise((r) => setTimeout(r, 300)); // небольшая пауза перед записью
   await writeChar.writeAsync(frame, true);
 
   const resp = await responsePromise;
@@ -114,10 +118,17 @@ async function main() {
     const adv = peripheral.advertisement;
     const uuids = adv.serviceUuids?.map((u) => u.toLowerCase()) || [];
     if (uuids.includes(SERVICE_UUID)) {
-      console.log(`Found target: ${peripheral.address} (${adv.localName || "?"})`);
+      console.log(
+        `Found target: ${peripheral.address || "(unknown)"} (${adv.localName || "?"})`
+      );
       await noble.stopScanningAsync();
-      await connectAndHandshake(peripheral);
-      process.exit(0);
+      try {
+        await connectAndHandshake(peripheral);
+      } catch (e) {
+        console.error("Handshake failed:", e);
+      } finally {
+        process.exit(0);
+      }
     }
   });
 }
